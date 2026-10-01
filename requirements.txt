@@ -1,0 +1,4 @@
+# torch/torchvision are installed separately by setup_windows.ps1 (CUDA or CPU build)
+ultralytics>=8.3,<9
+opencv-python>=4.9
+numpy

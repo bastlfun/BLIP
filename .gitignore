@@ -1,0 +1,41 @@
+# created by setup.bat (portable runtime, large)
+py/
+ffmpeg/
+models/
+_download/
+
+# output
+events_named/
+events_movement/
+
+# videos
+*.mp4
+*.m4v
+*.mov
+*.avi
+*.mkv
+*.ts
+*.mts
+*.mpg
+*.wmv
+*.flv
+*.webm
+*.3gp
+*.dav
+*.264
+*.h264
+*.h265
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
