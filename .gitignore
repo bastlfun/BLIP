@@ -9,6 +9,8 @@ events_named/
 events_movement/
 *.blip-*.json
 *.blip-*.json.tmp
+*.blip-*.log
+BLIP_summary_*.txt
 
 # videos
 *.mp4

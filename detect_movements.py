@@ -39,6 +39,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -156,7 +157,7 @@ def lower_priority() -> None:
             k32 = ctypes.windll.kernel32
             k32.SetPriorityClass(k32.GetCurrentProcess(), 0x4000)  # BELOW_NORMAL_PRIORITY_CLASS
         else:
-            os.nice(10)
+            os.nice(max(0, 10 - os.nice(0)))  # workers inherit it: do not lower twice
     except Exception:
         pass
 
@@ -982,6 +983,212 @@ def overall_line(jobs: list[dict], t0: float) -> str:
             f"running {fmt_hours(elapsed)}{eta}")
 
 
+# --------------------------------------------------------------------------- parallel folder mode
+#
+# Every video runs in its own process (this script with a single video), so a crash only stops that video.
+# Their output goes to <video>.blip-<mode>.log; the window shows one live status line per running video.
+
+def parallel_count(value: str, videos: int) -> int:
+    cores = os.cpu_count() or 2
+    if value.strip().lower() == "auto":
+        n = max(1, min(8, cores // 2))
+    else:
+        try:
+            n = int(value)
+        except ValueError:
+            sys.exit(f"--parallel expects a number or auto, got '{value}'")
+    return max(1, min(n, videos))
+
+
+def enable_ansi() -> bool:
+    """Cursor movement for the live status lines (Windows 10+ console needs it switched on)."""
+    if not sys.stdout.isatty():
+        return False
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        handle = k32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        return bool(k32.GetConsoleMode(handle, ctypes.byref(mode))
+                    and k32.SetConsoleMode(handle, mode.value | 0x0004))  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        return False
+
+
+class Board:
+    """Live status lines at the bottom of the window; messages scroll above them."""
+
+    def __init__(self, ansi: bool):
+        self.ansi, self.drawn, self.last = ansi, 0, 0.0
+
+    def _clear(self) -> None:
+        if self.ansi and self.drawn:
+            sys.stdout.write(f"\x1b[{self.drawn}F\x1b[J")  # up to the first status line, clear to the end
+            self.drawn = 0
+
+    def message(self, text: str) -> None:
+        self._clear()
+        print(text, flush=True)
+
+    def draw(self, lines: list[str], force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self.last < (1.0 if self.ansi else 60.0):
+            return  # without cursor movement only print the block once a minute
+        self.last = now
+        width = shutil.get_terminal_size((120, 25)).columns - 1
+        lines = [line[:width] for line in lines]  # a wrapped line would break the redraw
+        self._clear()
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+        if self.ansi:
+            self.drawn = len(lines)
+
+
+def worker_argv(args, video: Path, start: dt.datetime | None) -> list[str]:
+    """Command line for analysing one video in its own process, with the same settings as this run."""
+    a = [sys.executable, str(Path(__file__).resolve()), str(video),
+         "--model", str(args.model), "--device", args.device, "--classes", args.classes, "--conf", str(args.conf),
+         "--imgsz", str(args.imgsz), "--min-overlap", str(args.min_overlap), "--analyze-fps", str(args.analyze_fps),
+         "--sensitivity", str(args.sensitivity), "--min-area", str(args.min_area), "--gap", str(args.gap),
+         "--min-hits", str(args.min_hits), "--snapshot-every", str(args.snapshot_every),
+         "--jpg-quality", str(args.jpg_quality), "--decoder", args.decoder]
+    for region in args.ignore or []:
+        a += ["--ignore", region]
+    for flag, on in (("--no-object-detection", args.no_object_detection), ("--no-enhance", args.no_enhance),
+                     ("--all-frames", args.all_frames)):
+        if on:
+            a.append(flag)
+    if args.out:
+        a += ["--out", args.out]
+    if start:
+        a += ["--start-time", f"{start:%Y-%m-%d %H:%M:%S}"]
+    return a
+
+
+class Worker:
+    """One video analysed by its own process; its output goes to <video>.blip-<mode>.log."""
+
+    def __init__(self, job: dict, argv: list[str], mode: str, threads: int):
+        self.job, self.status, self.tail = job, "starting", []
+        self.log_path = job["video"].with_name(f"{job['video'].name}.blip-{mode}.log")
+        self.logf = open(self.log_path, "a", encoding="utf-8", errors="replace")
+        self.logf.write(f"\n===== {dt.datetime.now():%Y-%m-%d %H:%M:%S}  {subprocess.list2cmdline(argv)}\n")
+        # split the CPU between the workers (YOLO on CPU would otherwise start a thread per core in each)
+        env = dict(os.environ, OMP_NUM_THREADS=str(threads), MKL_NUM_THREADS=str(threads),
+                   PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
+        # own process group: Ctrl+C reaches only this window, which then stops the workers cleanly
+        kw = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+              else {"start_new_session": True})
+        self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, env=env, **kw)
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+
+    def _read(self) -> None:
+        """Finished lines go to the log, the latest (progress) line becomes the status."""
+        buf = ""
+        while True:
+            chunk = self.proc.stdout.read1(65536)
+            if not chunk:
+                break
+            buf += chunk.decode("utf-8", "replace")
+            while True:
+                m = re.search(r"[\r\n]", buf)
+                if not m:
+                    break
+                seg, delim, buf = buf[:m.start()], buf[m.start()], buf[m.end():]
+                if seg.strip():
+                    self.status = seg.strip()
+                if delim == "\n":
+                    self.logf.write(seg + "\n")
+                    self.logf.flush()
+                    if seg.strip():
+                        self.tail = (self.tail + [seg.rstrip()])[-20:]
+        if buf.strip():
+            self.logf.write(buf + "\n")
+            self.tail.append(buf.rstrip())
+
+    def interrupt(self) -> None:
+        """Like Ctrl+C in the worker: it saves its progress and stops."""
+        try:
+            self.proc.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        self.reader.join(timeout=10)
+        self.logf.close()
+
+    def line(self, total: int) -> str:
+        name = self.job["video"].name
+        name = name if len(name) <= 40 else name[:37] + "..."
+        return f"  [{self.job['index']}/{total}] {name:<40} {self.status}"
+
+
+def finish_job(w: Worker, mode: str) -> str:
+    """Status of a finished worker from its exit code and saved progress; returns a message for the window."""
+    job, rc = w.job, w.proc.returncode
+    try:
+        data = json.loads(job["video"].with_name(f"{job['video'].name}.blip-{mode}.json").read_text("utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if rc == 0 and data.get("phase") == "done":
+        job.update(status="done", events=len(data.get("events", [])), elapsed=float(data.get("elapsed", 0)))
+        return f"  [{job['index']}] done: {job['rel']}  ({job['events']} events, {fmt_hours(job['elapsed'])})"
+    if rc == 130:
+        job["status"] = "stopped"
+        return f"  [{job['index']}] stopped: {job['rel']}"
+    last = next((t.strip() for t in reversed(w.tail) if t.strip()), f"exit code {rc}")
+    job.update(status="failed", error=last)
+    tail = "\n".join(f"        {t}" for t in w.tail[-6:])
+    return f"  [{job['index']}] FAILED: {job['rel']}\n{tail}\n        full output: {w.log_path}"
+
+
+def run_parallel(jobs: list[dict], args, mode: str, folder: Path, summary: Path, n: int, t0: float) -> None:
+    todo = [j for j in jobs if j["status"] != "already done"]
+    threads = max(1, (os.cpu_count() or 2) // n)
+    for i, j in enumerate(jobs, 1):
+        j["index"] = i
+    board = Board(enable_ansi())
+    board.message(f"\nRunning {n} videos at a time (each in its own process, {threads} CPU threads each for YOLO).\n"
+                  f"Output of each video: <video>.blip-{mode}.log next to it.  Ctrl+C stops all, progress is saved.\n")
+    pending, running = list(todo), []
+    last_summary = 0.0
+    try:
+        while pending or running:
+            while pending and len(running) < n:
+                job = pending.pop(0)
+                job["status"] = "running"
+                running.append(Worker(job, worker_argv(args, job["video"], job["start"]), mode, threads))
+            for w in [w for w in running if w.proc.poll() is not None]:
+                running.remove(w)
+                w.close()
+                board.message(finish_job(w, mode))
+                write_summary(summary, folder, jobs, mode, t0)
+            if time.time() - last_summary > 60:
+                last_summary = time.time()
+                write_summary(summary, folder, jobs, mode, t0)
+            board.draw([f"  {overall_line(jobs, t0)}"] + [w.line(len(jobs)) for w in running])
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        board.message("\nStopping all videos, saving progress ...")
+        for w in running:
+            w.interrupt()
+        deadline = time.time() + 30
+        for w in running:
+            try:
+                w.proc.wait(timeout=max(0.1, deadline - time.time()))
+            except subprocess.TimeoutExpired:
+                w.proc.kill()
+                w.proc.wait()
+            w.close()
+            w.job["status"] = "stopped"
+        raise
+    board.draw([f"  {overall_line(jobs, t0)}"], force=True)
+
+
 # --------------------------------------------------------------------------- main
 
 def prescan(video: Path, info: VideoInfo, args, ignore: list, ffmpeg: str, state: State) -> list | None:
@@ -1189,10 +1396,15 @@ def main(argv=None):
     g.add_argument("--jpg-quality", type=int, default=90)
     g.add_argument("--decoder", choices=["auto", "opencv", "ffmpeg"], default="auto",
                    help="auto = OpenCV, falls back to ffmpeg if available")
+    g.add_argument("--parallel", default="auto",
+                   help="folder mode: videos analysed at the same time, each in its own process "
+                        "(auto = half the CPU threads, at most 8; 1 = one after another in this window)")
     g.add_argument("--all-frames", action="store_true",
                    help="old mode: decode and analyse the whole video instead of first scanning only the "
                         "keyframes for motion (much slower; the pre-scan needs ffmpeg)")
     args = ap.parse_args(argv)
+    if hasattr(signal, "SIGBREAK"):  # Windows: the folder mode stops its worker processes with Ctrl+Break
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
     disable_quick_edit()
     lower_priority()
 
@@ -1247,6 +1459,22 @@ def main(argv=None):
         jobs.append({"video": path, "rel": path.name, "duration": 0.0, "status": "waiting", "events": None,
                      "elapsed": 0.0, "start": start, "source": source})
 
+    folder = path.is_dir()
+    summary = path / f"BLIP_summary_{mode}.txt" if folder else None
+    t0 = time.time()
+    todo = sum(j["status"] != "already done" for j in jobs)
+    n = parallel_count(args.parallel, todo) if folder and todo else 1
+    if n > 1:  # every video in its own process, they load the model themselves
+        try:
+            run_parallel(jobs, args, mode, path, summary, n, t0)
+        except KeyboardInterrupt:
+            log("\nAborted. Progress is saved - run the same command again to continue.")
+            return 130
+        finally:
+            write_summary(summary, path, jobs, mode, t0)
+        log(f"\n##### finished: {overall_line(jobs, t0)}\n      summary -> {summary}")
+        return 0
+
     detector = None
     if not args.no_object_detection:
         if not Path(args.model).is_file():
@@ -1260,9 +1488,6 @@ def main(argv=None):
             except ImportError as e:
                 log(f"WARNING: could not load ultralytics/torch ({e}) -> no object detection, motion only")
 
-    folder = path.is_dir()
-    summary = path / f"BLIP_summary_{mode}.txt" if folder else None
-    t0 = time.time()
     try:
         for i, job in enumerate(jobs, 1):
             if job["status"] == "already done":

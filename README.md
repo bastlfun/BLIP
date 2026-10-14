@@ -12,8 +12,8 @@ This tool detects movements from a video file. It is designed for hours-long sta
 Open the terminal in the USB stick code folder, or drag a video file onto `detect.bat`.
 
 ```powershell
-# QUICK PLAY command to do object detection on videos in a folder with no displayed time 
-detect.bat "D:\cam\" --start-time auto
+# QUICK PLAY command to do object detection on videos in a folder with no displayed clock 
+detect.bat "D:\cam\" --start-time auto --parallel 10
 
 # Detect movements of vehicles, people, dogs, ...
 detect.bat "D:\cam\cam1.mp4"        # file
@@ -33,6 +33,8 @@ cut.bat "D:\cam\cam1.mp4" 00:12:30 00:14:00
 screenshot.bat "D:\cam\cam1.mp4"
 ```
 
+With a folder, several videos run at the same time, each in its own process. The window shows one live line per running video; the full output of each video is in `<video file>.blip-named.log` next to it, and `BLIP_summary_named.txt` in the folder lists all videos with status and events. A single video uses only a small part of a modern CPU, so more in parallel is faster until the CPU or the disk is busy (check Task Manager). With a small GPU (2 GB) use `--parallel 2` or `3`.
+
 Progress is saved next to the video (`<video file>.blip-named.json`/`.blip-movement.json`). After Ctrl+C, a crash or a power cut, run the **same command** again and it continues where it stopped. Changed settings start over; a finished video is skipped - delete its `.blip-*.json` to analyse it again.
 
 Useful options:
@@ -42,6 +44,7 @@ Useful options:
 --ignore 0,0,400,40     # ignore an area, e.g. the camera clock (x,y,w,h in pixels)
 --snapshot-every 10     # screenshot interval in seconds
 --all-frames            # no keyframe pre-scan, decode every frame (much slower, old mode)
+--parallel 12           # folder: videos analysed at the same time (default auto = half the CPU threads, max 8; 1 = one by one)
 --help                  # all options
 ```
 
