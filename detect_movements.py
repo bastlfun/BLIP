@@ -2,6 +2,9 @@
 """
 detect_movements.py - find moving people / vehicles / animals in security camera videos.
 
+Pre-scan (default, needs ffmpeg): only the keyframes are decoded (cameras store one every ~1-2 s) and checked
+for motion; the steps below then run only on the time ranges with motion. --all-frames analyses the whole video.
+
 Pipeline per analysed frame:
   1. Motion detection (OpenCV MOG2 background subtraction) - cheap, runs on every analysed frame.
   2. Object detection (YOLO, NVIDIA GPU if available, CPU otherwise) - only on frames with motion.
@@ -15,12 +18,16 @@ a screenshot is saved when the motion starts and then every 5 seconds while it c
 Output (next to the video; events_movement/ with --no-object-detection):
   events_named/<video>_events.txt
   events_named/<video>_E001_00h01m23s456.jpg   (timestamp = position in the video)
+  <video file>.blip-named.json                 (saved progress: run the same command again to continue
+                                                after Ctrl+C / a crash; when done, a rerun only says so)
 
 Examples:
   python detect_movements.py cam1.mp4
   python detect_movements.py cam1.mp4 --classes person --conf 0.5
   python detect_movements.py cam1.mp4 --no-object-detection  (no AI model, any motion)
   python detect_movements.py cam1.mp4 --start-time "2026-09-30 14:00:00"
+  python detect_movements.py D:\exports --start-time auto  (folder + subfolders, times from the file names)
+  python detect_movements.py cam1.mp4 --all-frames  (no pre-scan, every frame, much slower)
 """
 
 from __future__ import annotations
@@ -29,10 +36,14 @@ import argparse
 import datetime as dt
 import json
 import os
+import queue
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -46,7 +57,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 DEFAULT_MODEL = HERE / "models" / "yolo11s.pt"
 DEFAULT_CLASSES = "person,bicycle,car,motorcycle,bus,truck,cat,dog"
-MOTION = "motion"  # label of plain motion boxes (drawn without a text label)
+MOTION = "motion"  # label of plain motion boxes (--no-object-detection)
 RED = (0, 0, 255)  # BGR
 WHITE = (255, 255, 255)
 
@@ -82,6 +93,88 @@ def find_ffmpeg(name: str = "ffmpeg") -> str | None:
         if cand.is_file():
             return str(cand)
     return shutil.which(name)
+
+
+def start_ffmpeg(cmd: list[str], stderr) -> subprocess.Popen:
+    """ffmpeg in its own process group at below-normal priority: Ctrl+C only reaches Python (which then kills
+    ffmpeg at once, instead of ffmpeg ending "normally" and the scan carrying on) and the PC stays usable."""
+    if os.name == "nt":
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.BELOW_NORMAL_PRIORITY_CLASS
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr, creationflags=flags)
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr, start_new_session=True)  # nice: inherited
+
+
+def stop_ffmpeg(proc: subprocess.Popen) -> None:
+    proc.kill()  # first kill: closing a pipe that a reader thread is blocked on would hang
+    proc.wait()
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe:
+            pipe.close()
+
+
+def read_frames(proc: subprocess.Popen, size: int):
+    """Raw frames of `size` bytes from ffmpeg's stdout. The blocking pipe read runs in a thread and the main
+    thread only waits in short steps, so Ctrl+C works immediately (a blocked read ignores it on Windows)."""
+    frames: queue.Queue = queue.Queue(maxsize=4)
+    stop = threading.Event()
+
+    def reader():
+        while not stop.is_set():
+            try:
+                buf = proc.stdout.read(size)
+            except (OSError, ValueError):
+                buf = b""
+            item = buf if len(buf) == size else None
+            while not stop.is_set():
+                try:
+                    frames.put(item, timeout=0.2)
+                    break
+                except queue.Full:
+                    pass
+            if item is None:
+                return
+
+    threading.Thread(target=reader, daemon=True).start()
+    try:
+        while True:
+            try:
+                buf = frames.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if buf is None:
+                return
+            yield buf
+    finally:
+        stop.set()
+
+
+def lower_priority() -> None:
+    """Below-normal CPU priority for this process (ffmpeg children get it too): the PC stays usable."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            k32.SetPriorityClass(k32.GetCurrentProcess(), 0x4000)  # BELOW_NORMAL_PRIORITY_CLASS
+        else:
+            os.nice(10)
+    except Exception:
+        pass
+
+
+def disable_quick_edit() -> None:
+    """Windows console 'QuickEdit': one click into the window starts a selection and freezes the program at
+    its next output until Enter/Esc is pressed (and Ctrl+C then copies instead of aborting). Turn it off."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        handle = k32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if k32.GetConsoleMode(handle, ctypes.byref(mode)):
+            k32.SetConsoleMode(handle, (mode.value & ~0x0040) | 0x0080)  # -QUICK_EDIT, +EXTENDED_FLAGS
+    except Exception:
+        pass
 
 
 def parse_ignore(values: list[str]) -> list[tuple[int, int, int, int]]:
@@ -124,12 +217,16 @@ class OpenCVSource:
         )
         self.step = max(1, round(fps / analyze_fps)) if analyze_fps > 0 else 1
 
-    def frames(self):
+    def frames(self, start: float = 0.0, duration: float | None = None):
         idx = 0
+        if start > 0:
+            self.cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+            idx = int(round(self.cap.get(cv2.CAP_PROP_POS_FRAMES)))
+        end = start + duration if duration is not None else None
         while True:
             if idx % self.step == 0:
                 ok, frame = self.cap.read()
-                if not ok:
+                if not ok or (end is not None and idx / self.info.fps >= end):
                     break
                 yield idx / self.info.fps, frame
             elif not self.cap.grab():
@@ -145,6 +242,7 @@ class FFmpegSource:
         self.path, self.ffmpeg = path, ffmpeg
         self.info = self._probe()
         self.out_fps = analyze_fps if analyze_fps > 0 else self.info.fps
+        self.hwaccel = True  # off while YOLO uses the GPU, so they do not compete for it
 
     def _probe(self) -> VideoInfo:
         ffprobe = find_ffmpeg("ffprobe")
@@ -164,25 +262,121 @@ class FFmpegSource:
         return VideoInfo(int(st["width"]), int(st["height"]), fps,
                          float(data.get("format", {}).get("duration", 0) or 0))
 
-    def frames(self):
+    def frames(self, start: float = 0.0, duration: float | None = None):
+        """All frames at the analysis rate, or only `duration` seconds from `start` (fast input seek)."""
         w, h = self.info.width, self.info.height
-        cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-hwaccel", "auto",
-               "-i", str(self.path), "-an", "-sn",
-               "-vf", f"fps={self.out_fps},scale={w}:{h}",
-               "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=w * h * 3 * 4)
-        size, i = w * h * 3, 0
+        cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error"] + (["-hwaccel", "auto"] if self.hwaccel else [])
+        if start > 0:
+            cmd += ["-ss", f"{start:.3f}"]
+        cmd += ["-i", str(self.path), "-an", "-sn"]
+        if duration is not None:
+            cmd += ["-t", f"{duration:.3f}"]
+        cmd += ["-vf", f"fps={self.out_fps},scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+        proc = start_ffmpeg(cmd, subprocess.DEVNULL)
         try:
-            while True:
-                buf = proc.stdout.read(size)
-                if len(buf) < size:
-                    break
-                yield i / self.out_fps, np.frombuffer(buf, np.uint8).reshape(h, w, 3)
-                i += 1
+            for i, buf in enumerate(read_frames(proc, w * h * 3)):
+                yield start + i / self.out_fps, np.frombuffer(buf, np.uint8).reshape(h, w, 3)
         finally:
-            proc.stdout.close()
-            proc.kill()
-            proc.wait()
+            stop_ffmpeg(proc)
+
+
+# --------------------------------------------------------------------------- keyframe pre-scan
+#
+# Decoding every frame of 4K footage is the slow part, even when nothing moves. The pre-scan decodes only
+# the keyframes (security cameras typically store one every 1-2 s), runs motion detection on them and
+# returns the time ranges with motion. Only those ranges are then decoded and analysed at full rate.
+
+PRESCAN_WARN_KEY_GAP = 4.0  # s; with rarer keyframes short events can slip between two keyframes
+PRE_ROLL = 10.0            # s analysed before the motion so the background model can settle first
+PTS_RE = re.compile(rb"pts_time:\s*(-?[\d.]+)")
+
+
+def keyframe_gap(video: Path) -> float | None:
+    """Typical seconds between keyframes, from the first minute (reads packet headers only, no decoding)."""
+    ffprobe = find_ffmpeg("ffprobe")
+    if not ffprobe:
+        return None
+    cmd = [ffprobe, "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+60",
+           "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", str(video)]
+    try:
+        out = subprocess.run(cmd, capture_output=True, check=True, timeout=300).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    times = []
+    for line in out.decode(errors="ignore").splitlines():
+        pts, _, flags = line.strip().partition(",")
+        if flags.startswith("K"):
+            try:
+                times.append(float(pts))
+            except ValueError:
+                pass
+    times.sort()
+    if len(times) < 3:
+        return None
+    gaps = sorted(b - a for a, b in zip(times, times[1:]))
+    return gaps[len(gaps) // 2]
+
+
+def keyframes(video: Path, info: VideoInfo, ffmpeg: str, start: float = 0.0):
+    """Decodes only the keyframes (from `start`), downscaled to the motion detector's size. Yields (t, frame)."""
+    w = min(info.width, MotionDetector.WORK_WIDTH)
+    h = max(2, round(info.height * w / info.width / 2) * 2)
+    cmd = [ffmpeg, "-hide_banner", "-nostats", "-loglevel", "info", "-skip_frame", "nokey"]
+    if start > 0:
+        cmd += ["-ss", f"{start:.3f}"]  # timestamps then count from `start`
+    cmd += ["-i", str(video), "-an", "-sn", "-vf", f"scale={w}:{h},showinfo",
+           "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    proc = start_ffmpeg(cmd, subprocess.PIPE)
+    pts: queue.Queue = queue.Queue()
+
+    def read_pts():  # showinfo logs the real timestamp of every frame to stderr
+        try:
+            for line in proc.stderr:
+                m = PTS_RE.search(line)
+                if m and b"showinfo" in line:
+                    pts.put(float(m.group(1)))
+        except (OSError, ValueError):
+            pass  # pipe closed on abort
+
+    threading.Thread(target=read_pts, daemon=True).start()
+    try:
+        for buf in read_frames(proc, w * h * 3):
+            deadline = time.time() + 60
+            t = None
+            while t is None and time.time() < deadline:  # short steps: Ctrl+C stays responsive
+                try:
+                    t = pts.get(timeout=0.2)
+                except queue.Empty:
+                    pass
+            if t is None:
+                break
+            yield start + t, np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+    finally:
+        stop_ffmpeg(proc)
+
+
+def add_hit(spans: list[list[float]], t: float, link: float) -> None:
+    """Record a motion keyframe. Hits less than `link` s apart form one span [first, last] (keeps state small)."""
+    for span in reversed(spans[-3:]):  # hits arrive in time order, after a restart slightly overlapping
+        if span[0] - link <= t <= span[1] + link:
+            span[0], span[1] = min(span[0], t), max(span[1], t)
+            return
+    spans.append([t, t])
+    spans.sort()
+
+
+def merge_ranges(spans: list[list[float]], before: float, after: float, duration: float) -> list[list[float]]:
+    """Motion spans -> sorted, non-overlapping [start, end] ranges to analyse in detail."""
+    ranges: list[list[float]] = []
+    for first, last in sorted(spans):
+        a, b = max(0.0, first - before), last + after
+        if duration:
+            b = min(b, duration)
+        if ranges and a <= ranges[-1][1] + PRE_ROLL:  # close together: one range, no second warm-up
+            ranges[-1][1] = max(ranges[-1][1], b)
+        else:
+            ranges.append([a, b])
+    return ranges
 
 
 def open_source(path: Path, analyze_fps: float, decoder: str):
@@ -295,12 +489,38 @@ class Detection:
         return max(0, self.box[2] - self.box[0]) * max(0, self.box[3] - self.box[1])
 
 
+def cuda_supported(index: int) -> bool:
+    """Does the installed torch build contain kernels for this GPU? (e.g. cu128 builds dropped Pascal)"""
+    import torch
+    major, minor = torch.cuda.get_device_capability(index)
+    cc = major * 10 + minor
+    for arch in torch.cuda.get_arch_list():  # e.g. sm_75, sm_86, compute_120
+        kind, _, num = arch.partition("_")
+        n = int(num) if num.isdigit() else 0
+        if kind == "sm" and n // 10 == major and n <= cc:  # binary code runs on same major, >= minor
+            return True
+        if kind == "compute" and 0 < n <= cc:  # PTX is JIT-compiled for newer GPUs
+            return True
+    return False
+
+
 def pick_device(requested: str) -> str:
+    import warnings
     import torch
     if requested == "cpu":
         return "cpu"
-    if torch.cuda.is_available():
-        return "cuda:0" if requested in ("auto", "cuda", "gpu") else requested
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # torch's long "not compatible" warnings; we log our own
+        if torch.cuda.is_available():
+            device = "cuda:0" if requested in ("auto", "cuda", "gpu") else requested
+            index = int(device.partition(":")[2] or 0)
+            if cuda_supported(index):
+                return device
+            major, minor = torch.cuda.get_device_capability(index)
+            log(f"  WARNING: {torch.cuda.get_device_name(index)} (compute capability {major}.{minor}) is not "
+                f"supported by this PyTorch build -> using CPU. "
+                f"For older GPUs rebuild py\\ with: setup.bat -Cuda cu126")
+            return "cpu"
     if requested not in ("auto",):
         log(f"  WARNING: device '{requested}' requested but CUDA is not available -> using CPU")
     elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
@@ -311,14 +531,19 @@ def pick_device(requested: str) -> str:
 class ObjectDetector:
     def __init__(self, model_path: Path, device: str, conf: float, classes: list[str], imgsz: int,
                  enhance: bool = True):
+        # GPU check first: on an unsupported GPU this says so before the (slow) model load
+        self.device = pick_device(device)
         from ultralytics import YOLO
 
         # Local contrast boost: helps a lot on dark / washed-out black-and-white IR footage.
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if enhance else None
 
         self.model = YOLO(str(model_path))
-        self.device = pick_device(device)
-        self.half = self.device.startswith("cuda")
+        self.half = False
+        if self.device.startswith("cuda"):
+            import torch
+            # fp16 is only fast from Volta (7.x) on; on consumer Pascal (6.1) it is many times slower than fp32
+            self.half = torch.cuda.get_device_capability(self.device)[0] >= 7
         self.conf, self.imgsz = conf, imgsz
         names = self.model.names  # {id: name}
         wanted = {c.strip().lower() for c in classes if c.strip()}
@@ -329,13 +554,35 @@ class ObjectDetector:
         self.names = names
         if self.device.startswith("cuda"):
             import torch
-            log(f"  GPU: {torch.cuda.get_device_name(0)}")
+            log(f"  GPU: {torch.cuda.get_device_name(self.device)}" + ("" if self.half else " (fp32)"))
+            # claim the GPU now with a test run: errors show up at once (not after the pre-scan), and YOLO
+            # holds the GPU before ffmpeg could take it (GPUs in "exclusive process" mode allow only one user)
+            try:
+                self._predict(np.zeros((imgsz, imgsz, 3), np.uint8))
+            except Exception as e:
+                self._to_cpu(e)
+
+    def _predict(self, frame):
+        return self.model.predict(frame, device=self.device, conf=self.conf, classes=self.class_ids,
+                                  imgsz=self.imgsz, half=self.half, verbose=False)[0]
+
+    def _to_cpu(self, error: Exception) -> None:
+        first_line = str(error).strip().splitlines()[0] if str(error).strip() else type(error).__name__
+        log(f"\n  WARNING: GPU failed ({first_line}) -> continuing on CPU (slower). Is another program "
+            f"using the GPU? Check with: nvidia-smi")
+        self.device, self.half = "cpu", False
+        self.model.predictor = None  # set up again for the CPU
 
     def __call__(self, frame) -> list[Detection]:
         if self.clahe is not None:
             frame = cv2.cvtColor(self.clahe.apply(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)), cv2.COLOR_GRAY2BGR)
-        r = self.model.predict(frame, device=self.device, conf=self.conf, classes=self.class_ids,
-                               imgsz=self.imgsz, half=self.half, verbose=False)[0]
+        try:
+            r = self._predict(frame)
+        except Exception as e:
+            if not self.device.startswith("cuda"):
+                raise
+            self._to_cpu(e)
+            r = self._predict(frame)
         if r.boxes is None or len(r.boxes) == 0:
             return []
         xyxy = r.boxes.xyxy.cpu().numpy().astype(int)
@@ -351,16 +598,9 @@ def annotate(frame, dets: list[Detection], banner: str):
     h, w = img.shape[:2]
     thick = max(2, round(w / 640))
     font_scale = max(0.5, w / 1600)
-    for d in dets:
+    for d in dets:  # just the red box, no label text (the objects are listed in the report)
         x1, y1, x2, y2 = d.box
         cv2.rectangle(img, (max(0, x1), max(0, y1)), (min(w - 1, x2), min(h - 1, y2)), RED, thick)
-        if d.label == MOTION:
-            continue  # plain motion: just the red box
-        text = f"{d.label} {d.conf:.0%}"
-        (tw, th), bl = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thick)
-        ty = y1 - 4 if y1 - th - bl - 4 > 0 else y2 + th + 4
-        cv2.rectangle(img, (x1, ty - th - bl), (x1 + tw + 6, ty + bl // 2), RED, -1)
-        cv2.putText(img, text, (x1 + 3, ty - 2), cv2.FONT_HERSHEY_SIMPLEX, font_scale, WHITE, thick, cv2.LINE_AA)
     # timestamp banner, top-left
     (tw, th), bl = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thick)
     cv2.rectangle(img, (0, 0), (tw + 16, th + bl + 16), (0, 0, 0), -1)
@@ -487,42 +727,412 @@ def write_report(path: Path, video: Path, info: VideoInfo, rec: EventRecorder, s
 
 # --------------------------------------------------------------------------- main
 
+class Progress:
+    """One status line, updated at most once per second."""
+
+    def __init__(self, label: str, total: float, base: float = 0.0):
+        self.label, self.total, self.base = label, total, base  # base: already done before a restart
+        self.t0 = self.last = time.time()
+
+    def show(self, done: float, t: float, extra: str) -> None:
+        now = time.time()
+        if now - self.last < 1.0:
+            return
+        self.last = now
+        speed = (done - self.base) / (now - self.t0)
+        pct = f"{100 * done / self.total:5.1f}%" if self.total else ""
+        eta = f"ETA {fmt_ts((self.total - done) / speed)[:8]}" if self.total and speed > 0 else ""
+        print(f"\r  {self.label} {pct} {fmt_ts(t)}  {speed:5.1f}x realtime  {eta}  {extra}   ", end="", flush=True)
+
+
+# --------------------------------------------------------------------------- saved progress
+
+STATE_VERSION = 1
+SAVE_EVERY = 15.0  # s between progress saves (plus after every event and on Ctrl+C)
+
+
+class State:
+    """Progress file next to the video, named after it (<video file>.blip-named.json / .blip-movement.json).
+    Running the same command again continues where it stopped; other settings or a changed video start over."""
+
+    def __init__(self, video: Path, mode: str, settings: dict):
+        self.path = video.with_name(f"{video.name}.blip-{mode}.json")
+        self.ident = {"version": STATE_VERSION, "video_size": video.stat().st_size,
+                      "settings": json.loads(json.dumps(settings))}  # JSON-normalised for comparing
+        self.data: dict = {}
+        self.t0, self.elapsed_before = time.time(), 0.0
+        self.last_save = time.time()
+        self.broken = False
+
+    def load(self) -> str:
+        """Phase to continue with ('' = start from the beginning)."""
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return ""
+        except (OSError, ValueError):
+            log(f"  {self.path.name} unreadable -> starting from the beginning")
+            return ""
+        if data.get("version") != STATE_VERSION or data.get("video_size") != self.ident["video_size"]:
+            log(f"  {self.path.name} belongs to an older version of the video -> starting from the beginning")
+            return ""
+        if data.get("settings") != self.ident["settings"]:
+            log(f"  {self.path.name} was saved with other settings -> starting from the beginning")
+            return ""
+        self.data = data
+        self.elapsed_before = float(data.get("elapsed", 0.0))
+        return data.get("phase", "")
+
+    def elapsed(self) -> float:
+        return self.elapsed_before + time.time() - self.t0
+
+    def due(self) -> bool:
+        return time.time() - self.last_save >= SAVE_EVERY
+
+    def save(self, **changes) -> None:
+        self.data.update(changes)
+        self.last_save = time.time()
+        if self.broken:
+            return
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        try:  # write + rename: a crash mid-save never leaves a half-written state file
+            tmp.write_text(json.dumps({**self.data, **self.ident, "elapsed": round(self.elapsed(), 1)}),
+                           encoding="utf-8")
+            os.replace(tmp, self.path)
+        except OSError as e:
+            self.broken = True
+            log(f"\n  WARNING: cannot save progress to {self.path} ({e}) - a restart will begin from the start")
+
+
+def run_settings(args, objects: bool, out_dir: Path) -> dict:
+    """Everything that changes the result: saved progress is only reused with the same settings."""
+    s = {"mode": "objects" if objects else "motion-only", "all_frames": args.all_frames,
+         "analyze_fps": args.analyze_fps, "sensitivity": args.sensitivity, "min_area": args.min_area,
+         "ignore": args.ignore or [], "gap": args.gap, "min_hits": args.min_hits,
+         "snapshot_every": args.snapshot_every, "jpg_quality": args.jpg_quality,
+         "start_time": str(args.start_time or ""), "out": str(out_dir.resolve())}
+    if objects:
+        s.update(model=Path(args.model).name, classes=args.classes, conf=args.conf, imgsz=args.imgsz,
+                 enhance=not args.no_enhance, min_overlap=args.min_overlap)
+    return s
+
+
+def event_dicts(events: list) -> list[dict]:
+    return [{"start": e.start, "last": e.last, "hits": e.hits, "max_count": e.max_count, "files": e.files}
+            for e in events]
+
+
+def output_dir(video: Path, args, mode: str) -> Path:
+    # separate folders so a named run and a motion-only run can work on the same video in parallel
+    return Path(args.out) if args.out else video.parent / f"events_{mode}"
+
+
+# --------------------------------------------------------------------------- folder mode
+
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".ts", ".mts", ".m2ts", ".mpg", ".mpeg", ".wmv", ".flv",
+              ".webm", ".3gp"}
+# start time in a file name, e.g. Milestone "06_05_2026 23_59_59 (UTC+02_00)" (day first) or
+# "2026-05-06 23-59-59", "20260506_235959" (year first)
+NAME_TIMES = [
+    ("dmy", re.compile(r"(?<!\d)(\d{2})[_.-](\d{2})[_.-](\d{4})[ _T-]+(\d{2})[_.:-](\d{2})[_.:-](\d{2})(?!\d)")),
+    ("ymd", re.compile(r"(?<!\d)(\d{4})[_.-]?(\d{2})[_.-]?(\d{2})[ _T-]*(\d{2})[_.:-]?(\d{2})[_.:-]?(\d{2})(?!\d)")),
+]
+
+
+def time_from_name(name: str) -> dt.datetime | None:
+    for order, rx in NAME_TIMES:
+        for m in rx.finditer(name):
+            a, b, c, hh, mm, ss = (int(g) for g in m.groups())
+            day, month, year = (a, b, c) if order == "dmy" else (c, b, a)
+            if 2000 <= year <= 2100:
+                try:
+                    return dt.datetime(year, month, day, hh, mm, ss)
+                except ValueError:
+                    pass
+    return None
+
+
+def parse_time(text: str) -> dt.datetime:
+    """A typed start time: 2026-05-07 00:00:00, 07.05.2026 00:00:00 or the file name style 07_05_2026 00_00_00."""
+    text = text.strip().strip('"')
+    try:
+        return dt.datetime.fromisoformat(text)
+    except ValueError:
+        pass
+    for f in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M"):
+        try:
+            return dt.datetime.strptime(text, f)
+        except ValueError:
+            pass
+    t = time_from_name(text)
+    if t is None:
+        raise ValueError(text)
+    return t
+
+
+def start_time_for(video: Path) -> tuple[dt.datetime | None, str]:
+    """Automatic start time of a video + where it comes from."""
+    t = time_from_name(video.name)
+    return t, "from the file name" if t else "not found in the file name"
+
+
+def find_videos(folder: Path) -> list[Path]:
+    """All videos in the folder and its subfolders (not macOS '._' files, not BLIP's own output folders)."""
+    found = []
+    for p in folder.rglob("*"):
+        rel = p.relative_to(folder).parts
+        if (p.suffix.lower() in VIDEO_EXTS and not p.name.startswith("._") and p.is_file()
+                and not any(part.startswith("events_") for part in rel[:-1])):
+            found.append(p)
+    return sorted(found, key=lambda p: str(p).lower())
+
+
+def probe_duration(video: Path) -> float:
+    ffprobe = find_ffmpeg("ffprobe")
+    if ffprobe:
+        cmd = [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(video)]
+        try:
+            return float(subprocess.run(cmd, capture_output=True, timeout=60).stdout.strip() or 0)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return 0.0
+    cap = cv2.VideoCapture(str(video))
+    fps, n = cap.get(cv2.CAP_PROP_FPS) or 0, cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    cap.release()
+    return n / fps if fps > 0 else 0.0
+
+
+def saved_state(video: Path, args, mode: str) -> dict:
+    """Saved progress of this video if it was made with the same settings (start time aside), else {}."""
+    path = video.with_name(f"{video.name}.blip-{mode}.json")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        size = video.stat().st_size
+    except (OSError, ValueError):
+        return {}
+    want = json.loads(json.dumps(run_settings(args, mode == "named", output_dir(video, args, mode))))
+    have = dict(data.get("settings", {}))
+    want.pop("start_time"), have.pop("start_time", None)
+    ok = data.get("version") == STATE_VERSION and data.get("video_size") == size and have == want
+    return data if ok else {}
+
+
+def fmt_hours(seconds: float) -> str:
+    return f"{int(seconds // 3600)}h{int(seconds % 3600 // 60):02d}m"
+
+
+def ask_start_times(jobs: list[dict]) -> None:
+    """Show the start time chosen for each video; Enter keeps it, or type the right one ('-' = none)."""
+    todo = [j for j in jobs if j["status"] != "already done"]
+    log(f"\nCheck the start times ({len(todo)} video{'s' if len(todo) != 1 else ''}): Enter = OK, "
+        f"or type the right one (e.g. 2026-05-07 00:00:00 or 07.05.2026 00:00:00), '-' = no clock time")
+    for i, job in enumerate(jobs, 1):
+        log(f"\n  [{i}/{len(jobs)}] {job['rel']}")
+        if job["status"] == "already done":
+            log("        already analysed -> skipped")
+            continue
+        shown = job["start"].strftime("%Y-%m-%d %H:%M:%S") if job["start"] else "none"
+        while True:
+            try:
+                answer = input(f"        start time: {shown}  ({job['source']})  > ").strip()
+            except EOFError:  # no keyboard (input redirected): keep the proposals
+                answer = ""
+            if not answer:
+                break
+            if answer == "-":
+                job["start"] = None
+                break
+            try:
+                job["start"] = parse_time(answer)
+                log(f"        -> {job['start']:%Y-%m-%d %H:%M:%S}")
+                break
+            except ValueError:
+                log("        not understood - e.g. 2026-05-07 00:00:00 or 07.05.2026 00:00:00 ('-' = none)")
+
+
+def write_summary(path: Path, folder: Path, jobs: list[dict], mode: str, t0: float) -> None:
+    lines = [f"BLIP summary: {folder}",
+             f"Mode:    {'objects (events_named)' if mode == 'named' else 'any motion (events_movement)'}",
+             f"Updated: {dt.datetime.now():%Y-%m-%d %H:%M:%S}  (running {fmt_hours(time.time() - t0)})", "",
+             f"{'#':>3}  {'Status':<13} {'Events':>6}  {'Length':>7}  {'Took':>7}  {'Start time':<19}  Video"]
+    lines.append("-" * len(lines[-1]))
+    for i, j in enumerate(jobs, 1):
+        start = f"{j['start']:%Y-%m-%d %H:%M:%S}" if j["start"] else "-"
+        events = str(j["events"]) if j["events"] is not None else ""
+        took = fmt_hours(j["elapsed"]) if j["elapsed"] else ""
+        lines.append(f"{i:>3}  {j['status']:<13} {events:>6}  {fmt_hours(j['duration']):>7}  {took:>7}  "
+                     f"{start:<19}  {j['rel']}")
+        if j.get("error"):
+            lines.append(f"{'':5}error: {j['error']}")
+    try:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as e:
+        log(f"  WARNING: cannot write {path} ({e})")
+
+
+def overall_line(jobs: list[dict], t0: float) -> str:
+    finished = [j for j in jobs if j["status"] in ("done", "failed")]
+    work = [j for j in jobs if j["status"] != "already done"]
+    done_len = sum(j["duration"] for j in finished)
+    total_len = sum(j["duration"] for j in work)
+    elapsed = time.time() - t0
+    eta = (f"  ~{fmt_hours(elapsed / done_len * (total_len - done_len))} left"
+           if done_len and total_len > done_len else "")
+    return (f"videos {len(finished)}/{len(work)} done ({sum(j['status'] == 'failed' for j in jobs)} failed)  "
+            f"events {sum(j['events'] or 0 for j in jobs)}  video {fmt_hours(done_len)} of {fmt_hours(total_len)}  "
+            f"running {fmt_hours(elapsed)}{eta}")
+
+
+# --------------------------------------------------------------------------- main
+
+def prescan(video: Path, info: VideoInfo, args, ignore: list, ffmpeg: str, state: State) -> list | None:
+    """Time ranges that need a detailed look, or None if the pre-scan cannot be used for this video."""
+    gap = state.data.get("key_gap") or keyframe_gap(video)
+    if not gap or gap <= 0:
+        log("  pre-scan: could not read the keyframes -> full analysis")
+        return None
+    log(f"  pre-scan: keyframe every {gap:.2f}s")
+    if gap > PRESCAN_WARN_KEY_GAP:
+        log(f"  WARNING: keyframes only every {gap:.1f}s (more than {PRESCAN_WARN_KEY_GAP:.0f}s) - motion shorter "
+            f"than that can be missed. Use --all-frames to analyse every frame (much slower).")
+    before, after = gap + PRE_ROLL, gap + args.gap + 1
+    link = before + after + PRE_ROLL  # hits closer than this end up in the same detail range anyway
+    s = min(1.0, MotionDetector.WORK_WIDTH / info.width)
+    small = VideoInfo(min(info.width, MotionDetector.WORK_WIDTH), max(2, round(info.height * s / 2) * 2),
+                      1 / gap, info.duration)
+    motion = MotionDetector(small, args.min_area, args.sensitivity,
+                            [tuple(int(v * s) for v in r) for r in ignore], 1 / gap)
+
+    spans: list[list[float]] = state.data.get("spans", [])
+    pos = float(state.data.get("scan_pos", 0.0))
+    # after a restart scan a few keyframes again: the new background model is blind while it settles
+    start = max(0.0, pos - (motion.warmup + 1) * gap)
+    if start == 0:
+        add_hit(spans, motion.warmup * gap, link)  # blind at the very start -> look at it in detail
+    else:
+        log(f"  pre-scan: continuing at {fmt_ts(pos)}")
+    n, t0 = 0, time.time()
+    progress = Progress("pre-scan", info.duration, base=start)
+    try:
+        for t, frame in keyframes(video, info, ffmpeg, start):
+            n += 1
+            if motion.apply(frame)[1]:
+                add_hit(spans, t, link)
+            pos = max(pos, t)
+            if state.due():
+                state.save(phase="prescan", key_gap=gap, scan_pos=pos, spans=spans)
+            progress.show(t, t, f"motion spots: {len(spans)}")
+    finally:  # also on Ctrl+C
+        state.save(phase="prescan", key_gap=gap, scan_pos=pos, spans=spans)
+    if n == 0 and start == 0:
+        log("\r  pre-scan: no keyframes decoded -> full analysis" + " " * 60)
+        return None
+    if info.duration and pos < info.duration - 2 * gap - 1:
+        log(f"\r  WARNING: pre-scan stopped early at {fmt_ts(pos)} (damaged or unfinished file?) "
+            f"-> the rest is analysed in detail" + " " * 20)
+        spans.append([pos, info.duration])
+    ranges = merge_ranges(spans, before, after, info.duration)
+    total = sum(b - a for a, b in ranges)
+    pct = f" ({100 * total / info.duration:.1f}% of the video)" if info.duration else ""
+    log(f"\r  pre-scan: done in {time.time() - t0:.0f}s, motion in {len(ranges)} "
+        f"range{'s' if len(ranges) != 1 else ''}, {fmt_ts(total)[:8]} to analyse in detail{pct}" + " " * 10)
+    return ranges
+
+
 def process_video(video: Path, args, detector) -> None:
     log(f"\n=== {video}")
-    src = open_source(video, args.analyze_fps, args.decoder)
+    mode = "movement" if detector is None else "named"
+    out_dir = output_dir(video, args, mode)
+    state = State(video, mode, run_settings(args, detector is not None, out_dir))
+    phase = state.load()
+    if phase == "done":
+        log(f"  already analysed with these settings -> {state.data.get('report', out_dir)}\n"
+            f"  (delete {state.path.name} next to the video to analyse it again)")
+        return {"status": "already done", "events": len(state.data.get("events", [])),
+                "elapsed": state.elapsed_before, "report": state.data.get("report", "")}
+
+    ffmpeg = find_ffmpeg()
+    src = None
+    if not args.all_frames and args.decoder != "opencv":
+        if ffmpeg:
+            try:
+                src = FFmpegSource(video, args.analyze_fps, ffmpeg)
+            except (IOError, OSError, subprocess.SubprocessError, KeyError, IndexError, ValueError) as e:
+                log(f"  pre-scan: ffprobe could not read the video ({e}) -> full analysis")
+        else:
+            log("  pre-scan: needs ffmpeg (./ffmpeg/ or PATH) -> full analysis")
+    if src is None:
+        src = open_source(video, args.analyze_fps, args.decoder)
+    if isinstance(src, FFmpegSource) and detector is not None and detector.device.startswith("cuda"):
+        src.hwaccel = False
     info = src.info
     log(f"  {info.width}x{info.height}, {info.fps:.2f} fps, {fmt_ts(info.duration)}  [{type(src).__name__}]")
 
-    # separate folders so a named run and a motion-only run can work on the same video in parallel
-    out_dir = Path(args.out) if args.out else video.parent / ("events_movement" if detector is None else "events_named")
-    motion = MotionDetector(info, args.min_area, args.sensitivity, parse_ignore(args.ignore), args.analyze_fps)
+    ignore = parse_ignore(args.ignore)
     rec = EventRecorder(video, out_dir, args.gap, args.min_hits, args.snapshot_every,
                         args.start_time, args.jpg_quality)
+    rec.events = [Event(start=e["start"], last=e["last"], hits=e["hits"], max_count=e["max_count"],
+                        files=e["files"]) for e in state.data.get("events", [])]
+    if phase:
+        log(f"  continuing from {state.path.name} ({len(rec.events)} events so far)")
+
+    if phase == "detail":
+        ranges = state.data.get("ranges")
+    else:
+        ranges = None
+        if isinstance(src, FFmpegSource) and not args.all_frames:
+            ranges = prescan(video, info, args, ignore, ffmpeg, state)
+        state.save(phase="detail", ranges=ranges, detail_pos=0.0)
+    if ranges is None and isinstance(src, FFmpegSource) and args.decoder == "auto":
+        src = open_source(video, args.analyze_fps, args.decoder)  # same decoder as without pre-scan
+
+    whole = ranges is None
+    spans = [[0.0, info.duration or float("inf")]] if whole else ranges
+    total = info.duration if whole else sum(b - a for a, b in spans)
+    resume = float(state.data.get("detail_pos", 0.0))  # everything before it is analysed already
+    if resume > 0:
+        log(f"  detail: continuing at {fmt_ts(resume)}")
+
+    def done_at(t: float) -> float:
+        return sum(max(0.0, min(b, t) - a) for a, b in spans)
+
+    def save_progress(t: float) -> None:
+        # an event still running is redone after a restart -> continue at its start, not at t
+        state.save(phase="detail", detail_pos=rec.active.start if rec.active else t,
+                   events=event_dicts(rec.events))
 
     pad = max(8, info.width // 50)
-    t0 = last_print = time.time()
-    n = 0
-    for t, frame in src.frames():
-        n += 1
-        mask, mboxes = motion.apply(frame)
-        dets: list[Detection] = []
-        if mboxes:
-            if detector is None:
-                dets = [Detection(MOTION, 1.0, b) for b in merge_boxes(mboxes, pad)]
-            else:
-                dets = [d for d in detector(frame) if motion.motion_fraction(mask, d.box) >= args.min_overlap]
-        rec.update(t, frame, dets)
-
-        now = time.time()
-        if now - last_print > 1.0:
-            last_print = now
-            speed = t / (now - t0)
-            pct = f"{100 * t / info.duration:5.1f}%" if info.duration else ""
-            eta = f"ETA {fmt_ts((info.duration - t) / speed)[:8]}" if info.duration and speed > 0 else ""
-            print(f"\r  {pct} {fmt_ts(t)}  {speed:5.1f}x realtime  {eta}  events: {len(rec.events)}   ",
-                  end="", flush=True)
+    progress = Progress("" if whole else "detail", total, base=done_at(resume))
+    n, saved_events, t = 0, len(rec.events), resume
+    try:
+        for i, (a, b) in enumerate(spans, 1):
+            if b <= resume:
+                continue
+            start = a if a >= resume else max(a, resume - PRE_ROLL)  # pre-roll lets the background settle
+            # fresh background model per range: the video jumps, the old background would be wrong
+            motion = MotionDetector(info, args.min_area, args.sensitivity, ignore, args.analyze_fps)
+            part = "" if whole else f"range {i}/{len(spans)}  "
+            for t, frame in src.frames(start, None if whole else b - start):
+                n += 1
+                mask, mboxes = motion.apply(frame)
+                if t < resume:
+                    continue  # analysed before the restart, only feeds the background model
+                dets: list[Detection] = []
+                if mboxes:
+                    if detector is None:
+                        dets = [Detection(MOTION, 1.0, b) for b in merge_boxes(mboxes, pad)]
+                    else:
+                        dets = [d for d in detector(frame) if motion.motion_fraction(mask, d.box) >= args.min_overlap]
+                rec.update(t, frame, dets)
+                if len(rec.events) != saved_events or state.due():
+                    saved_events = len(rec.events)
+                    save_progress(t)
+                progress.show(done_at(t), t, f"{part}events: {len(rec.events)}")
+            if not whole:
+                save_progress(b)
+    except BaseException:
+        save_progress(t)  # Ctrl+C or error: keep what is done
+        raise
     rec.finish()
-    elapsed = time.time() - t0
 
     out_dir.mkdir(parents=True, exist_ok=True)
     report = out_dir / f"{video.stem}_events.txt"
@@ -530,16 +1140,19 @@ def process_video(video: Path, args, detector) -> None:
                 + ("" if detector is None else f" model={Path(args.model).name} device={detector.device}"
                    f" classes={args.classes} conf={args.conf}")
                 + f" analyze-fps={args.analyze_fps} sensitivity={args.sensitivity} min-area={args.min_area}"
-                f" gap={args.gap}s snapshot-every={args.snapshot_every}s")
-    write_report(report, video, info, rec, settings, elapsed)
-    log(f"\r  done: {n} frames analysed in {elapsed:.0f}s, {len(rec.events)} events -> {report}" + " " * 10)
+                f" gap={args.gap}s snapshot-every={args.snapshot_every}s"
+                + (" pre-scan=off" if whole else f" pre-scan={len(spans)} ranges/{fmt_ts(total)[:8]}"))
+    write_report(report, video, info, rec, settings, state.elapsed())
+    state.save(phase="done", report=str(report), events=event_dicts(rec.events))
+    log(f"\r  done: {n} frames analysed in {state.elapsed():.0f}s, {len(rec.events)} events -> {report}" + " " * 10)
+    return {"status": "done", "events": len(rec.events), "elapsed": state.elapsed(), "report": str(report)}
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Detect moving people/objects in security camera videos and save marked screenshots.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("video", help="video file (any format ffmpeg/OpenCV can read)")
+    ap.add_argument("video", help="video file, or a folder: all videos in it and its subfolders, one after another")
     ap.add_argument("--out", help="output folder (default: <video folder>/events_named, or events_movement with --no-object-detection)")
 
     g = ap.add_argument_group("object detection")
@@ -570,19 +1183,69 @@ def main(argv=None):
     g.add_argument("--snapshot-every", type=float, default=None,
                    help="screenshot at event start and every N seconds while it lasts "
                         "(default: 5 with --no-object-detection, otherwise 0 = only the best frame)")
-    g.add_argument("--start-time", type=lambda s: dt.datetime.fromisoformat(s),
-                   help='wall-clock time of video start, e.g. "2026-09-30 14:00:00"')
+    g.add_argument("--start-time",
+                   help='wall-clock time of video start, e.g. "2026-09-30 14:00:00", or "auto": read it from the '
+                        'file name (e.g. "06_05_2026 23_59_59 ...mkv"); with a folder each one is shown for checking')
     g.add_argument("--jpg-quality", type=int, default=90)
     g.add_argument("--decoder", choices=["auto", "opencv", "ffmpeg"], default="auto",
                    help="auto = OpenCV, falls back to ffmpeg if available")
+    g.add_argument("--all-frames", action="store_true",
+                   help="old mode: decode and analyse the whole video instead of first scanning only the "
+                        "keyframes for motion (much slower; the pre-scan needs ffmpeg)")
     args = ap.parse_args(argv)
+    disable_quick_edit()
+    lower_priority()
 
-    video = Path(args.video.strip('"'))
-    if video.is_dir():
-        sys.exit(f"Please give a video file, not a folder: {video}")
-    if not video.is_file():
-        sys.exit(f"Video not found: {video}")
-    video = video.resolve()
+    path = Path(args.video.strip('"'))
+    if not path.exists():
+        sys.exit(f"Not found: {path}")
+    path = path.resolve()
+    auto = (args.start_time or "").strip().lower() == "auto"
+    if args.start_time and not auto:
+        if path.is_dir():
+            sys.exit("With a folder use --start-time auto (each video gets its own start time)")
+        try:
+            args.start_time = parse_time(args.start_time)
+        except ValueError:
+            sys.exit(f'--start-time: cannot read "{args.start_time}", e.g. "2026-05-07 00:00:00" or auto')
+
+    # the mode decides the output folder and which saved progress belongs to this run
+    objects = not args.no_object_detection and Path(args.model).is_file()
+    mode = "named" if objects else "movement"
+    if args.snapshot_every is None:
+        args.snapshot_every = 0.0 if objects else 5.0
+
+    jobs = []
+    if path.is_dir():
+        videos = find_videos(path)
+        if not videos:
+            sys.exit(f"No videos found in {path} (or its subfolders)")
+        log(f"Found {len(videos)} video{'s' if len(videos) != 1 else ''} in {path}")
+        for v in videos:
+            saved = saved_state(v, args, mode)
+            job = {"video": v, "rel": str(v.relative_to(path)), "duration": probe_duration(v),
+                   "status": "already done" if saved.get("phase") == "done" else "waiting",
+                   "events": None, "elapsed": 0.0, "start": None, "source": ""}
+            if saved:  # same start time as last time, or the saved progress would not be used
+                st = saved["settings"].get("start_time") or ""
+                job["start"] = dt.datetime.fromisoformat(st) if st else None
+                job["source"] = "from the saved progress"
+            elif auto:
+                job["start"], job["source"] = start_time_for(v)
+            else:
+                job["source"] = "no --start-time auto"
+            if job["status"] == "already done":
+                job["events"] = len(saved.get("events", []))
+            jobs.append(job)
+        if auto:
+            ask_start_times(jobs)
+    else:
+        start, source = args.start_time, "--start-time"
+        if auto:
+            start, source = start_time_for(path)
+            log(f"Start time: {f'{start:%Y-%m-%d %H:%M:%S}' if start else 'none'} ({source})")
+        jobs.append({"video": path, "rel": path.name, "duration": 0.0, "status": "waiting", "events": None,
+                     "elapsed": 0.0, "start": start, "source": source})
 
     detector = None
     if not args.no_object_detection:
@@ -596,14 +1259,39 @@ def main(argv=None):
                 log(f"  device: {detector.device}")
             except ImportError as e:
                 log(f"WARNING: could not load ultralytics/torch ({e}) -> no object detection, motion only")
-    if args.snapshot_every is None:
-        args.snapshot_every = 5.0 if detector is None else 0.0
 
+    folder = path.is_dir()
+    summary = path / f"BLIP_summary_{mode}.txt" if folder else None
+    t0 = time.time()
     try:
-        process_video(video, args, detector)
+        for i, job in enumerate(jobs, 1):
+            if job["status"] == "already done":
+                continue
+            if folder:
+                log(f"\n##### [{i}/{len(jobs)}] {overall_line(jobs, t0)}")
+                write_summary(summary, path, jobs, mode, t0)
+            run_args = argparse.Namespace(**vars(args))
+            run_args.start_time = job["start"]
+            job["status"] = "running"
+            try:
+                result = process_video(job["video"], run_args, detector)
+                job.update(status=result["status"], events=result["events"], elapsed=result["elapsed"])
+            except KeyboardInterrupt:
+                job["status"] = "stopped"
+                raise
+            except Exception as e:
+                if not folder:
+                    raise
+                log(f"\n  ERROR with {job['rel']}:\n{traceback.format_exc()}  -> continuing with the next video")
+                job.update(status="failed", error=f"{type(e).__name__}: {e}")
     except KeyboardInterrupt:
-        log("\nAborted.")
+        log("\nAborted. Progress is saved - run the same command again to continue.")
         return 130
+    finally:
+        if folder:
+            write_summary(summary, path, jobs, mode, t0)
+    if folder:
+        log(f"\n##### finished: {overall_line(jobs, t0)}\n      summary -> {summary}")
     return 0
 
 
