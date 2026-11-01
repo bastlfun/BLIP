@@ -2,7 +2,7 @@
 This tool detects movements from a video file. It is designed for hours-long static security camera footage and can detect movement, categorize them by type (car, person, bicycle, ...) by default, or switch to the detection of any movement for more hits.
 
 ## Intro
-* Tool works on offline PCs, but for first installation (if there is no `/py`, go to an online PC to download the packages)
+* Tool works on offline PCs, but for first installation (if there is no `/py`), go to an online PC to download the packages
 * Supported input file formats: `.mp4, .mov, .m4v, .avi, .mkv, .ts/.mts, .mpg, .wmv, .flv, .webm, .3gp`
 * Recommended: NVIDIA GPU (cuda support)
 
